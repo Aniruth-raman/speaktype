@@ -335,6 +335,7 @@ impl Streamer {
         app: &AppHandle,
         paster: Paster,
         restore_clipboard: bool,
+        paste_chunks: bool,
     ) -> Option<Streamer> {
         let buffer = recording.buffer();
         let rate = recording.sample_rate;
@@ -370,7 +371,9 @@ impl Streamer {
                                 let mut text = thread_text.lock_unpoisoned();
                                 if let Some(paste) = extend_transcript(&mut text, &chunk_text) {
                                     drop(text);
-                                    paster.paste(paste, restore_clipboard);
+                                    if paste_chunks {
+                                        paster.paste(paste, restore_clipboard);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -485,6 +488,7 @@ impl Session {
                     &self.app,
                     self.paster.clone(),
                     settings.restore_clipboard,
+                    settings.recording_mode == RecordingMode::Toggle,
                 );
                 self.phase = Phase::Recording {
                     recording,
@@ -532,8 +536,10 @@ impl Session {
 
         let app = self.app.clone();
         let controller = self.controller.clone();
+        let settings = self.state().settings();
         let paster = self.paster.clone();
-        let restore_clipboard = self.state().settings().restore_clipboard;
+        let restore_clipboard = settings.restore_clipboard;
+        let paste_chunks = settings.recording_mode == RecordingMode::Toggle;
         let worker = thread::Builder::new()
             .name("transcription".into())
             .spawn(move || {
@@ -545,6 +551,7 @@ impl Session {
                     streamed,
                     paster,
                     restore_clipboard,
+                    paste_chunks,
                     cancelled,
                 );
                 controller.send(Event::Transcribed { session, outcome });
@@ -684,6 +691,7 @@ fn transcribe(
     streamed: (String, usize),
     paster: Paster,
     restore_clipboard: bool,
+    paste_chunks: bool,
     cancelled: bool,
 ) -> Outcome {
     let on_warming = |warming| controller.send(Event::Warming { session, warming });
@@ -697,11 +705,18 @@ fn transcribe(
             String::new()
         };
         let tail = pipeline::clean(app, &tail_raw, true);
-        // The chunks were already pasted as they arrived; only the tail is left.
-        if let Some(paste) = extend_transcript(&mut transcript, &tail)
-            && !cancelled
-        {
-            paster.paste(paste, restore_clipboard);
+        let tail_paste = extend_transcript(&mut transcript, &tail);
+        if !cancelled {
+            if paste_chunks {
+                // Chunks were already pasted as they arrived; only the tail is left.
+                if let Some(paste) = tail_paste {
+                    paster.paste(paste, restore_clipboard);
+                }
+            } else if !transcript.is_empty() {
+                // Hold mode kept the hotkey's modifiers down while speaking, so
+                // paste once now that they have been released.
+                paster.paste(transcript.clone(), restore_clipboard);
+            }
         }
         pipeline::save(app, &captured.samples, captured.duration_secs, &transcript)?;
         Ok(())
