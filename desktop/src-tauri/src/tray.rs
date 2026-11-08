@@ -5,7 +5,10 @@
 //! trays don't report clicks, so there the menu is the only option.
 
 use std::{
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -34,12 +37,59 @@ static LAST_BLUR_HIDE: Mutex<Option<Instant>> = Mutex::new(None);
 /// Clicks on the icon this soon after the panel hid itself are that same click.
 const REOPEN_DELAY: Duration = Duration::from_millis(300);
 
-// Template images: macOS tints them to match the menu bar.
+// Template images: macOS tints them to match the menu bar. Windows and Linux
+// do not tint, so dark taskbars need the white variants.
 const ICON_IDLE: &[u8] = include_bytes!("../icons/tray/idle.png");
 const ICON_RECORDING: &[u8] = include_bytes!("../icons/tray/recording.png");
 const ICON_BUSY: &[u8] = include_bytes!("../icons/tray/busy.png");
+const ICON_IDLE_LIGHT: &[u8] = include_bytes!("../icons/tray/idle-light.png");
+const ICON_RECORDING_LIGHT: &[u8] = include_bytes!("../icons/tray/recording-light.png");
+const ICON_BUSY_LIGHT: &[u8] = include_bytes!("../icons/tray/busy-light.png");
+
+/// The dictation state the tray is showing: 0 idle, 1 recording, 2 busy.
+static STATE: AtomicU8 = AtomicU8::new(0);
+/// Whether the white icon variants are needed (dark taskbar).
+static USE_LIGHT: AtomicBool = AtomicBool::new(false);
+
+fn icon_variant(state: u8, light: bool) -> &'static [u8] {
+    match (state, light) {
+        (1, false) => ICON_RECORDING,
+        (1, true) => ICON_RECORDING_LIGHT,
+        (2, false) => ICON_BUSY,
+        (2, true) => ICON_BUSY_LIGHT,
+        (_, false) => ICON_IDLE,
+        (_, true) => ICON_IDLE_LIGHT,
+    }
+}
+
+fn icon_bytes() -> &'static [u8] {
+    icon_variant(
+        STATE.load(Ordering::Relaxed),
+        USE_LIGHT.load(Ordering::Relaxed),
+    )
+}
+
+fn apply_icon(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    if let Ok(icon) = Image::from_bytes(icon_bytes()) {
+        let _ = tray.set_icon_with_as_template(Some(icon), true);
+    }
+}
+
+fn system_is_dark(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|window| window.theme().ok())
+        == Some(tauri::Theme::Dark)
+}
 
 pub fn build(app: &AppHandle, visible: bool) -> tauri::Result<()> {
+    USE_LIGHT.store(
+        !cfg!(target_os = "macos") && system_is_dark(app),
+        Ordering::Relaxed,
+    );
+
     let open = MenuItem::with_id(app, "open", "Open SpeakType", true, None::<&str>)?;
     let dictate = MenuItem::with_id(app, "dictate", "Start Dictation", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
@@ -52,7 +102,7 @@ pub fn build(app: &AppHandle, visible: bool) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("SpeakType")
-        .icon(Image::from_bytes(ICON_IDLE)?)
+        .icon(Image::from_bytes(icon_bytes())?)
         .icon_as_template(true)
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -81,16 +131,22 @@ pub fn build(app: &AppHandle, visible: bool) -> tauri::Result<()> {
 
 /// Swaps the icon to show whether SpeakType is idle, recording or transcribing.
 pub fn show_state(app: &AppHandle, state: &DictationState) {
-    let Some(tray) = app.tray_by_id(TRAY_ID) else {
-        return;
-    };
-    let bytes = match state {
-        DictationState::Idle => ICON_IDLE,
-        DictationState::Recording { .. } => ICON_RECORDING,
-        DictationState::Transcribing => ICON_BUSY,
-    };
-    if let Ok(icon) = Image::from_bytes(bytes) {
-        let _ = tray.set_icon_with_as_template(Some(icon), true);
+    STATE.store(
+        match state {
+            DictationState::Idle => 0,
+            DictationState::Recording { .. } => 1,
+            DictationState::Transcribing => 2,
+        },
+        Ordering::Relaxed,
+    );
+    apply_icon(app);
+}
+
+/// Swaps the black and white icon sets when the system theme changes.
+pub fn set_dark(app: &AppHandle, dark: bool) {
+    let light = dark && !cfg!(target_os = "macos");
+    if USE_LIGHT.swap(light, Ordering::Relaxed) != light {
+        apply_icon(app);
     }
 }
 
@@ -208,10 +264,23 @@ fn panel_origin(
 
 #[cfg(test)]
 mod tests {
-    use super::panel_origin;
+    use super::{
+        ICON_BUSY, ICON_BUSY_LIGHT, ICON_IDLE, ICON_IDLE_LIGHT, ICON_RECORDING,
+        ICON_RECORDING_LIGHT, icon_variant, panel_origin,
+    };
 
     const SCREEN: (f64, f64, f64, f64) = (0.0, 0.0, 1920.0, 1080.0);
     const PANEL: (f64, f64) = (300.0, 400.0);
+
+    #[test]
+    fn tray_icon_follows_the_taskbar_theme() {
+        assert!(std::ptr::eq(icon_variant(0, false), ICON_IDLE));
+        assert!(std::ptr::eq(icon_variant(0, true), ICON_IDLE_LIGHT));
+        assert!(std::ptr::eq(icon_variant(1, false), ICON_RECORDING));
+        assert!(std::ptr::eq(icon_variant(1, true), ICON_RECORDING_LIGHT));
+        assert!(std::ptr::eq(icon_variant(2, false), ICON_BUSY));
+        assert!(std::ptr::eq(icon_variant(2, true), ICON_BUSY_LIGHT));
+    }
 
     #[test]
     fn opens_below_a_menu_bar_icon() {
