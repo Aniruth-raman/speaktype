@@ -12,7 +12,11 @@
 use std::{
     mem,
     panic::{self, AssertUnwindSafe},
-    sync::mpsc::{self, Sender},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, RecvTimeoutError, Sender},
+    },
     thread,
     time::Duration,
 };
@@ -23,7 +27,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use crate::{
     AppState, LockExt,
-    audio::{Captured, Recording},
+    audio::{Captured, Recording, WHISPER_SAMPLE_RATE, resample},
     history::now_ms,
     paste::Paster,
     pill::{self, PillState},
@@ -41,6 +45,28 @@ const STOPPING: &str = "Stopping transcription...";
 const ERROR_MESSAGE: Duration = Duration::from_millis(2000);
 const NO_SPEECH_MESSAGE: Duration = Duration::from_millis(1500);
 const STOPPING_MESSAGE: Duration = Duration::from_millis(800);
+
+/// Streaming chunks are cut at a pause once at least this long, or at the cap.
+const CHUNK_MIN: usize = 3 * (WHISPER_SAMPLE_RATE as usize);
+const CHUNK_MAX: usize = 8 * (WHISPER_SAMPLE_RATE as usize);
+const PAUSE_WINDOW: usize = (WHISPER_SAMPLE_RATE as usize) / 5;
+const PAUSE_RMS: f32 = 0.01;
+/// Shorter tails aren't worth a second transcription pass.
+const MIN_TAIL: usize = (WHISPER_SAMPLE_RATE as usize) / 4;
+
+/// How many samples to transcribe now: at a pause once the chunk is long
+/// enough, or at the cap. `None` means keep buffering.
+fn cut_point(pending: &[f32]) -> Option<usize> {
+    if pending.len() < CHUNK_MIN {
+        return None;
+    }
+    if pending.len() >= CHUNK_MAX {
+        return Some(CHUNK_MAX);
+    }
+    let window = &pending[pending.len() - PAUSE_WINDOW..];
+    let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+    (rms < PAUSE_RMS).then_some(pending.len())
+}
 
 /// Broadcast to the UI as `dictation-state`.
 #[derive(Debug, Clone, Serialize)]
@@ -174,6 +200,7 @@ enum Phase {
     Recording {
         recording: Recording,
         by_hotkey: bool,
+        stream: Option<Streamer>,
     },
     Transcribing {
         session: u64,
@@ -278,6 +305,103 @@ impl Controller {
     }
 }
 
+/// Transcribes the recording in the background while the user speaks, so the
+/// final paste only has to process the tail.
+struct Streamer {
+    stop: Sender<()>,
+    done: Option<thread::JoinHandle<()>>,
+    text: Arc<Mutex<String>>,
+    processed: Arc<AtomicUsize>,
+    failed: Arc<AtomicBool>,
+}
+
+impl Streamer {
+    fn start(recording: &Recording, app: &AppHandle) -> Option<Streamer> {
+        let buffer = recording.buffer();
+        let rate = recording.sample_rate;
+        let (stop, stop_rx) = mpsc::channel();
+        let text = Arc::new(Mutex::new(String::new()));
+        let processed = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        let thread_text = text.clone();
+        let thread_processed = processed.clone();
+        let thread_failed = failed.clone();
+        let app = app.clone();
+        let done = thread::Builder::new()
+            .name("transcribe-stream".into())
+            .spawn(move || {
+                let mut pending = Vec::new();
+                let mut cursor = 0;
+                loop {
+                    match stop_rx.recv_timeout(Duration::from_millis(250)) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                    let (raw, end) = {
+                        let buffer = buffer.lock_unpoisoned();
+                        let end = buffer.len();
+                        (buffer.get(cursor..).unwrap_or_default().to_vec(), end)
+                    };
+                    cursor = end;
+                    pending.extend(resample(&raw, rate, WHISPER_SAMPLE_RATE));
+                    while let Some(n) = cut_point(&pending) {
+                        let chunk: Vec<f32> = pending.drain(..n).collect();
+                        match pipeline::transcribe(&app, &chunk, |_| {}) {
+                            Ok(chunk_text) => {
+                                thread_processed.fetch_add(n, Ordering::Relaxed);
+                                let chunk_text = chunk_text.trim();
+                                if !chunk_text.is_empty() {
+                                    let mut text = thread_text.lock_unpoisoned();
+                                    if !text.is_empty() {
+                                        text.push(' ');
+                                    }
+                                    text.push_str(chunk_text);
+                                }
+                            }
+                            Err(_) => {
+                                thread_failed.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .ok()?;
+        Some(Streamer {
+            stop,
+            done: Some(done),
+            text,
+            processed,
+            failed,
+        })
+    }
+
+    /// Stops the worker and returns its text, whether it failed, and how many
+    /// 16 kHz samples it covered.
+    fn finish(mut self) -> (String, bool, usize) {
+        self.stop();
+        let text = mem::take(&mut *self.text.lock_unpoisoned());
+        (
+            text,
+            self.failed.load(Ordering::Relaxed),
+            self.processed.load(Ordering::Relaxed),
+        )
+    }
+
+    fn stop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(done) = self.done.take() {
+            let _ = done.join();
+        }
+    }
+}
+
+impl Drop for Streamer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 struct Session {
     app: AppHandle,
     controller: Controller,
@@ -344,9 +468,11 @@ impl Session {
         match recording {
             Ok(recording) => {
                 let started_at_ms = now_ms();
+                let stream = Streamer::start(&recording, &self.app);
                 self.phase = Phase::Recording {
                     recording,
                     by_hotkey,
+                    stream,
                 };
                 self.set_cancel_key(true);
                 self.show(PillState::Recording { started_at_ms });
@@ -362,9 +488,16 @@ impl Session {
     }
 
     fn stop(&mut self, cancelled: bool) {
-        let Phase::Recording { recording, .. } = mem::replace(&mut self.phase, Phase::Idle) else {
+        let Phase::Recording {
+            recording, stream, ..
+        } = mem::replace(&mut self.phase, Phase::Idle)
+        else {
             return;
         };
+        // Stop the chunk worker before the microphone so the tail starts cleanly.
+        let streamed = stream
+            .map(Streamer::finish)
+            .unwrap_or((String::new(), true, 0));
         let captured = match recording.finish() {
             Ok(captured) => captured,
             Err(e) => {
@@ -387,7 +520,7 @@ impl Session {
         let worker = thread::Builder::new()
             .name("transcription".into())
             .spawn(move || {
-                let outcome = transcribe(&app, &controller, session, &captured);
+                let outcome = transcribe(&app, &controller, session, &captured, streamed);
                 controller.send(Event::Transcribed { session, outcome });
             });
         if let Err(e) = worker {
@@ -531,19 +664,48 @@ fn transcribe(
     controller: &Controller,
     session: u64,
     captured: &Captured,
+    streamed: (String, bool, usize),
 ) -> Outcome {
     let on_warming = |warming| controller.send(Event::Warming { session, warming });
+    let (partial, failed, processed) = streamed;
     // Without an outcome the session would stay transcribing until Escape.
-    panic::catch_unwind(AssertUnwindSafe(|| {
-        pipeline::run(app, &captured.samples, captured.duration_secs, on_warming)
+    panic::catch_unwind(AssertUnwindSafe(|| -> Outcome {
+        if failed {
+            return pipeline::run(app, &captured.samples, captured.duration_secs, &on_warming)
+                .map(|item| item.transcript);
+        }
+        let tail = captured.samples.get(processed..).unwrap_or_default();
+        let tail = if tail.len() >= MIN_TAIL {
+            pipeline::transcribe(app, tail, &on_warming)?
+        } else {
+            String::new()
+        };
+        let raw = match (partial.is_empty(), tail.is_empty()) {
+            (true, _) => tail,
+            (_, true) => partial,
+            _ => format!("{partial} {tail}"),
+        };
+        pipeline::finish(app, &captured.samples, captured.duration_secs, &raw)
+            .map(|item| item.transcript)
     }))
     .unwrap_or_else(|_| Err(pipeline::Error::Transcribe("The engine crashed".into())))
-    .map(|item| item.transcript)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunks_cut_at_a_pause_or_the_cap() {
+        assert_eq!(cut_point(&vec![0.1; CHUNK_MIN - 1]), None);
+        // Loud audio below the cap keeps buffering.
+        assert_eq!(cut_point(&vec![0.1; CHUNK_MIN]), None);
+        assert_eq!(cut_point(&vec![0.1; CHUNK_MAX]), Some(CHUNK_MAX));
+        // A 200ms pause ends the chunk early.
+        let mut quiet = vec![0.1; CHUNK_MIN];
+        quiet.extend(std::iter::repeat(0.0).take(PAUSE_WINDOW));
+        assert_eq!(cut_point(&quiet), Some(quiet.len()));
+    }
 
     /// Runs `inputs` from `activity`, returning each action.
     fn run(activity: Activity, mode: RecordingMode, inputs: &[Input]) -> Vec<Action> {
