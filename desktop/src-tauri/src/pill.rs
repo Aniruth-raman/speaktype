@@ -39,6 +39,9 @@ pub fn update(app: &AppHandle, state: PillState, position: PillPosition, always_
         place(app, position);
         let _ = window.show();
     }
+    // Re-assert topmost on every state change: another always-on-top window
+    // created later would otherwise sit above the pill.
+    let _ = window.set_always_on_top(true);
 }
 
 /// Lets the pill receive clicks and hover (while recording) or passes them
