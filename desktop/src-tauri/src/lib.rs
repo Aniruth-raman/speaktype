@@ -380,6 +380,15 @@ pub fn run() {
         .expect("error while building SpeakType");
 
     app.run(|app, event| {
+        // The Windows/Linux tray does not tint its icon, so follow the system
+        // theme and swap to the white variant when the taskbar turns dark.
+        if let tauri::RunEvent::WindowEvent {
+            event: WindowEvent::ThemeChanged(theme),
+            ..
+        } = &event
+        {
+            tray::set_dark(app, *theme == tauri::Theme::Dark);
+        }
         // macOS: clicking the Dock icon brings the hidden window back.
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = event {
