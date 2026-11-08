@@ -1,4 +1,4 @@
-//! Audio in, cleaned-up text out: shared by dictation and file transcription.
+//! Audio in, cleaned-up text out.
 
 use std::{
     fmt,
@@ -54,21 +54,6 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Transcribes 16 kHz mono audio with the selected model, saves the recording
-/// and the result to history, and returns the history item.
-///
-/// `on_warming` is called with `true` before the model starts loading and
-/// `false` once it is done, whether or not loading succeeded.
-pub fn run(
-    app: &AppHandle,
-    samples: &[f32],
-    duration_secs: f64,
-    on_warming: impl Fn(bool),
-) -> Result<HistoryItem, Error> {
-    let raw = transcribe(app, samples, on_warming)?;
-    finish(app, samples, duration_secs, &raw)
-}
-
 /// Transcribes with the selected model, loading it first when needed, and
 /// returns the raw text. Used for whole recordings and streaming chunks.
 pub fn transcribe(
@@ -94,31 +79,37 @@ pub fn transcribe(
         .map_err(Error::Transcribe)
 }
 
-/// Cleans up `raw`, saves the recording and the result to history, and returns
-/// the history item.
-pub fn finish(
+/// Cleans raw text with the saved settings. `strip_trailing` removes the final
+/// period; streaming chunks keep theirs so sentences don't run together.
+pub fn clean(app: &AppHandle, raw: &str, strip_trailing: bool) -> String {
+    let state = app.state::<AppState>();
+    let settings = state.settings();
+    text::process(
+        raw,
+        &text::Options {
+            auto_edit: settings.auto_edit,
+            smart_trailing_punctuation: strip_trailing && settings.smart_trailing_punctuation,
+            dictionary: &settings.dictionary,
+        },
+    )
+}
+
+/// Saves an already cleaned transcript and the recording, and returns the
+/// history item. Used by the streaming path, which pastes chunks as it goes.
+pub fn save(
     app: &AppHandle,
     samples: &[f32],
     duration_secs: f64,
-    raw: &str,
+    text: &str,
 ) -> Result<HistoryItem, Error> {
+    if text.is_empty() {
+        return Err(Error::NoSpeech);
+    }
     let state = app.state::<AppState>();
     let settings = state.settings();
     let model = models::find(&settings.selected_model)
         .filter(|m| state.models.is_downloaded(m.id))
         .ok_or(Error::NoModel)?;
-
-    let text = text::process(
-        raw,
-        &text::Options {
-            auto_edit: settings.auto_edit,
-            smart_trailing_punctuation: settings.smart_trailing_punctuation,
-            dictionary: &settings.dictionary,
-        },
-    );
-    if text.is_empty() {
-        return Err(Error::NoSpeech);
-    }
 
     // The WAV is written without holding the history lock, so the UI can still
     // read history meanwhile.
@@ -131,7 +122,7 @@ pub fn finish(
     let added = state
         .history
         .lock_unpoisoned()
-        .add(&text, duration_secs, model.name, audio_path);
+        .add(text, duration_secs, model.name, audio_path);
     let _ = app.emit("history-changed", ());
 
     // Saving is best effort: the text is still returned if the disk write failed.
@@ -146,7 +137,7 @@ pub fn finish(
         id: String::new(),
         created_at: history::now_ms(),
         word_count: text.split_whitespace().count(),
-        transcript: text,
+        transcript: text.to_string(),
         duration_secs,
         model: model.name.into(),
         audio_path: None,
