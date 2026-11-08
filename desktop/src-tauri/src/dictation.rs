@@ -14,7 +14,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
     },
     thread,
@@ -47,8 +47,8 @@ const NO_SPEECH_MESSAGE: Duration = Duration::from_millis(1500);
 const STOPPING_MESSAGE: Duration = Duration::from_millis(800);
 
 /// Streaming chunks are cut at a pause once at least this long, or at the cap.
-const CHUNK_MIN: usize = 3 * (WHISPER_SAMPLE_RATE as usize);
-const CHUNK_MAX: usize = 8 * (WHISPER_SAMPLE_RATE as usize);
+const CHUNK_MIN: usize = 5 * (WHISPER_SAMPLE_RATE as usize) / 2;
+const CHUNK_MAX: usize = 6 * (WHISPER_SAMPLE_RATE as usize);
 const PAUSE_WINDOW: usize = (WHISPER_SAMPLE_RATE as usize) / 5;
 const PAUSE_RMS: f32 = 0.01;
 /// Shorter tails aren't worth a second transcription pass.
@@ -66,6 +66,23 @@ fn cut_point(pending: &[f32]) -> Option<usize> {
     let window = &pending[pending.len() - PAUSE_WINDOW..];
     let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
     (rms < PAUSE_RMS).then_some(pending.len())
+}
+
+/// Adds a cleaned chunk to the transcript and returns the text to paste, with a
+/// separating space unless this is the first chunk. `None` means nothing to
+/// paste (an empty chunk).
+fn extend_transcript(transcript: &mut String, text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let paste = if transcript.is_empty() {
+        text.to_string()
+    } else {
+        format!(" {text}")
+    };
+    transcript.push_str(&paste);
+    Some(paste)
 }
 
 /// Broadcast to the UI as `dictation-state`.
@@ -104,7 +121,7 @@ pub enum Event {
     RefreshPill,
 }
 
-type Outcome = Result<String, pipeline::Error>;
+type Outcome = Result<(), pipeline::Error>;
 
 /// Input from the user, as opposed to progress from the app itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,8 +221,6 @@ enum Phase {
     },
     Transcribing {
         session: u64,
-        /// Escape was pressed while recording.
-        cancelled: bool,
     },
     /// A short status message before returning to idle.
     Message {
@@ -305,27 +320,29 @@ impl Controller {
     }
 }
 
-/// Transcribes the recording in the background while the user speaks, so the
-/// final paste only has to process the tail.
+/// Transcribes the recording in the background while the user speaks, pasting
+/// each chunk as soon as it is ready.
 struct Streamer {
     stop: Sender<()>,
     done: Option<thread::JoinHandle<()>>,
     text: Arc<Mutex<String>>,
     processed: Arc<AtomicUsize>,
-    failed: Arc<AtomicBool>,
 }
 
 impl Streamer {
-    fn start(recording: &Recording, app: &AppHandle) -> Option<Streamer> {
+    fn start(
+        recording: &Recording,
+        app: &AppHandle,
+        paster: Paster,
+        restore_clipboard: bool,
+    ) -> Option<Streamer> {
         let buffer = recording.buffer();
         let rate = recording.sample_rate;
         let (stop, stop_rx) = mpsc::channel();
         let text = Arc::new(Mutex::new(String::new()));
         let processed = Arc::new(AtomicUsize::new(0));
-        let failed = Arc::new(AtomicBool::new(false));
         let thread_text = text.clone();
         let thread_processed = processed.clone();
-        let thread_failed = failed.clone();
         let app = app.clone();
         let done = thread::Builder::new()
             .name("transcribe-stream".into())
@@ -349,17 +366,15 @@ impl Streamer {
                         match pipeline::transcribe(&app, &chunk, |_| {}) {
                             Ok(chunk_text) => {
                                 thread_processed.fetch_add(n, Ordering::Relaxed);
-                                let chunk_text = chunk_text.trim();
-                                if !chunk_text.is_empty() {
-                                    let mut text = thread_text.lock_unpoisoned();
-                                    if !text.is_empty() {
-                                        text.push(' ');
-                                    }
-                                    text.push_str(chunk_text);
+                                let chunk_text = pipeline::clean(&app, &chunk_text, false);
+                                let mut text = thread_text.lock_unpoisoned();
+                                if let Some(paste) = extend_transcript(&mut text, &chunk_text) {
+                                    drop(text);
+                                    paster.paste(paste, restore_clipboard);
                                 }
                             }
-                            Err(_) => {
-                                thread_failed.store(true, Ordering::Relaxed);
+                            Err(e) => {
+                                eprintln!("[dictation] chunk transcription failed: {e}");
                                 return;
                             }
                         }
@@ -372,18 +387,15 @@ impl Streamer {
             done: Some(done),
             text,
             processed,
-            failed,
         })
     }
 
-    /// Stops the worker and returns its text, whether it failed, and how many
-    /// 16 kHz samples it covered.
-    fn finish(mut self) -> (String, bool, usize) {
+    /// Stops the worker and returns its transcript and how many 16 kHz samples
+    /// it covered.
+    fn finish(mut self) -> (String, usize) {
         self.stop();
-        let text = mem::take(&mut *self.text.lock_unpoisoned());
         (
-            text,
-            self.failed.load(Ordering::Relaxed),
+            mem::take(&mut *self.text.lock_unpoisoned()),
             self.processed.load(Ordering::Relaxed),
         )
     }
@@ -468,7 +480,12 @@ impl Session {
         match recording {
             Ok(recording) => {
                 let started_at_ms = now_ms();
-                let stream = Streamer::start(&recording, &self.app);
+                let stream = Streamer::start(
+                    &recording,
+                    &self.app,
+                    self.paster.clone(),
+                    settings.restore_clipboard,
+                );
                 self.phase = Phase::Recording {
                     recording,
                     by_hotkey,
@@ -495,9 +512,7 @@ impl Session {
             return;
         };
         // Stop the chunk worker before the microphone so the tail starts cleanly.
-        let streamed = stream
-            .map(Streamer::finish)
-            .unwrap_or((String::new(), true, 0));
+        let streamed = stream.map(Streamer::finish).unwrap_or((String::new(), 0));
         let captured = match recording.finish() {
             Ok(captured) => captured,
             Err(e) => {
@@ -508,7 +523,7 @@ impl Session {
 
         self.next_id += 1;
         let session = self.next_id;
-        self.phase = Phase::Transcribing { session, cancelled };
+        self.phase = Phase::Transcribing { session };
         let message = if cancelled { STOPPING } else { TRANSCRIBING };
         self.show(PillState::Processing {
             message: message.into(),
@@ -517,10 +532,21 @@ impl Session {
 
         let app = self.app.clone();
         let controller = self.controller.clone();
+        let paster = self.paster.clone();
+        let restore_clipboard = self.state().settings().restore_clipboard;
         let worker = thread::Builder::new()
             .name("transcription".into())
             .spawn(move || {
-                let outcome = transcribe(&app, &controller, session, &captured, streamed);
+                let outcome = transcribe(
+                    &app,
+                    &controller,
+                    session,
+                    &captured,
+                    streamed,
+                    paster,
+                    restore_clipboard,
+                    cancelled,
+                );
                 controller.send(Event::Transcribed { session, outcome });
             });
         if let Err(e) = worker {
@@ -533,7 +559,7 @@ impl Session {
         // After Escape or a newer dictation the pill has moved on.
         let current = matches!(
             self.phase,
-            Phase::Transcribing { session: s, cancelled: false, .. } if s == session
+            Phase::Transcribing { session: s } if s == session
         );
         if !current {
             return;
@@ -548,11 +574,7 @@ impl Session {
     }
 
     fn transcribed(&mut self, session: u64, outcome: Outcome) {
-        let Phase::Transcribing {
-            session: current,
-            cancelled,
-        } = self.phase
-        else {
+        let Phase::Transcribing { session: current } = self.phase else {
             return;
         };
         if current != session {
@@ -560,13 +582,8 @@ impl Session {
         }
 
         match outcome {
-            Ok(text) => {
-                self.go_idle();
-                if !cancelled {
-                    let restore = self.state().settings().restore_clipboard;
-                    self.paster.paste(text, restore);
-                }
-            }
+            // Streaming already pasted the chunks and the tail.
+            Ok(()) => self.go_idle(),
             Err(e) => {
                 if let Some(detail) = e.detail() {
                     eprintln!("[dictation] {detail}");
@@ -664,29 +681,30 @@ fn transcribe(
     controller: &Controller,
     session: u64,
     captured: &Captured,
-    streamed: (String, bool, usize),
+    streamed: (String, usize),
+    paster: Paster,
+    restore_clipboard: bool,
+    cancelled: bool,
 ) -> Outcome {
     let on_warming = |warming| controller.send(Event::Warming { session, warming });
-    let (partial, failed, processed) = streamed;
+    let (mut transcript, processed) = streamed;
     // Without an outcome the session would stay transcribing until Escape.
     panic::catch_unwind(AssertUnwindSafe(|| -> Outcome {
-        if failed {
-            return pipeline::run(app, &captured.samples, captured.duration_secs, &on_warming)
-                .map(|item| item.transcript);
-        }
         let tail = captured.samples.get(processed..).unwrap_or_default();
-        let tail = if tail.len() >= MIN_TAIL {
+        let tail_raw = if tail.len() >= MIN_TAIL {
             pipeline::transcribe(app, tail, &on_warming)?
         } else {
             String::new()
         };
-        let raw = match (partial.is_empty(), tail.is_empty()) {
-            (true, _) => tail,
-            (_, true) => partial,
-            _ => format!("{partial} {tail}"),
-        };
-        pipeline::finish(app, &captured.samples, captured.duration_secs, &raw)
-            .map(|item| item.transcript)
+        let tail = pipeline::clean(app, &tail_raw, true);
+        // The chunks were already pasted as they arrived; only the tail is left.
+        if let Some(paste) = extend_transcript(&mut transcript, &tail)
+            && !cancelled
+        {
+            paster.paste(paste, restore_clipboard);
+        }
+        pipeline::save(app, &captured.samples, captured.duration_secs, &transcript)?;
+        Ok(())
     }))
     .unwrap_or_else(|_| Err(pipeline::Error::Transcribe("The engine crashed".into())))
 }
@@ -705,6 +723,21 @@ mod tests {
         let mut quiet = vec![0.1; CHUNK_MIN];
         quiet.extend(std::iter::repeat(0.0).take(PAUSE_WINDOW));
         assert_eq!(cut_point(&quiet), Some(quiet.len()));
+    }
+
+    #[test]
+    fn transcript_chunks_are_space_separated() {
+        let mut transcript = String::new();
+        assert_eq!(
+            extend_transcript(&mut transcript, "Hello."),
+            Some("Hello.".to_string())
+        );
+        assert_eq!(
+            extend_transcript(&mut transcript, " Next."),
+            Some(" Next.".to_string())
+        );
+        assert_eq!(extend_transcript(&mut transcript, "   "), None);
+        assert_eq!(transcript, "Hello. Next.");
     }
 
     /// Runs `inputs` from `activity`, returning each action.
