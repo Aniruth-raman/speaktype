@@ -79,13 +79,16 @@ pub fn list_input_devices() -> Vec<InputDevice> {
 }
 
 /// Samples shared between the device callback and the capture thread.
-type Buffer = Arc<Mutex<Vec<f32>>>;
+pub type Buffer = Arc<Mutex<Vec<f32>>>;
 
 /// A running microphone capture. Dropping it without calling `finish` stops
 /// the microphone and discards the audio.
 pub struct Recording {
     stop_tx: Sender<()>,
     done_rx: Receiver<Captured>,
+    buffer: Buffer,
+    /// The device's sample rate, for reading chunks while recording.
+    pub sample_rate: u32,
 }
 
 impl Recording {
@@ -97,24 +100,25 @@ impl Recording {
         on_level: impl Fn(f32) + Send + 'static,
     ) -> Result<Recording, String> {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
         let (done_tx, done_rx) = mpsc::channel();
         let device_id = device_id.to_string();
+        let buffer = Buffer::default();
+        let capture_buffer = buffer.clone();
 
         thread::Builder::new()
             .name("audio-capture".into())
             .spawn(move || {
                 let started = Instant::now();
-                let buffer = Buffer::default();
                 let level = Arc::new(AtomicU32::new(NO_LEVEL));
-                let (stream, sample_rate) = match open_stream(&device_id, &buffer, &level) {
+                let (stream, sample_rate) = match open_stream(&device_id, &capture_buffer, &level) {
                     Ok(opened) => opened,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                         return;
                     }
                 };
-                let _ = ready_tx.send(Ok(()));
+                let _ = ready_tx.send(Ok(sample_rate));
 
                 // Polling at half the meter's interval forwards every update
                 // without visibly delaying any.
@@ -135,7 +139,7 @@ impl Recording {
 
                 // The callback can't be holding the lock now that the stream is
                 // gone, and a Vec<f32> is valid even if a callback panicked.
-                let samples = std::mem::take(&mut *buffer.lock_unpoisoned());
+                let samples = std::mem::take(&mut *capture_buffer.lock_unpoisoned());
                 let _ = done_tx.send(Captured {
                     duration_secs: started.elapsed().as_secs_f64(),
                     samples: resample(&samples, sample_rate, WHISPER_SAMPLE_RATE),
@@ -144,10 +148,20 @@ impl Recording {
             .map_err(|e| e.to_string())?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Recording { stop_tx, done_rx }),
+            Ok(Ok(sample_rate)) => Ok(Recording {
+                stop_tx,
+                done_rx,
+                buffer,
+                sample_rate,
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("Audio thread exited before the microphone opened".into()),
         }
+    }
+
+    /// A handle to the raw samples still being captured, for streaming chunks.
+    pub fn buffer(&self) -> Buffer {
+        self.buffer.clone()
     }
 
     /// Stops the microphone and returns the audio.

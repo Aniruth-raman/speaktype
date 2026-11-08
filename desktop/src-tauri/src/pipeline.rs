@@ -65,6 +65,17 @@ pub fn run(
     duration_secs: f64,
     on_warming: impl Fn(bool),
 ) -> Result<HistoryItem, Error> {
+    let raw = transcribe(app, samples, on_warming)?;
+    finish(app, samples, duration_secs, &raw)
+}
+
+/// Transcribes with the selected model, loading it first when needed, and
+/// returns the raw text. Used for whole recordings and streaming chunks.
+pub fn transcribe(
+    app: &AppHandle,
+    samples: &[f32],
+    on_warming: impl Fn(bool),
+) -> Result<String, Error> {
     let state = app.state::<AppState>();
     let settings = state.settings();
     let model = models::find(&settings.selected_model)
@@ -78,13 +89,27 @@ pub fn run(
         on_warming(false);
         loaded.map_err(Error::ModelLoad)?;
     }
-    let raw = engine
+    engine
         .transcribe(samples, &settings.language)
-        .map_err(Error::Transcribe)?;
-    drop(engine);
+        .map_err(Error::Transcribe)
+}
+
+/// Cleans up `raw`, saves the recording and the result to history, and returns
+/// the history item.
+pub fn finish(
+    app: &AppHandle,
+    samples: &[f32],
+    duration_secs: f64,
+    raw: &str,
+) -> Result<HistoryItem, Error> {
+    let state = app.state::<AppState>();
+    let settings = state.settings();
+    let model = models::find(&settings.selected_model)
+        .filter(|m| state.models.is_downloaded(m.id))
+        .ok_or(Error::NoModel)?;
 
     let text = text::process(
-        &raw,
+        raw,
         &text::Options {
             auto_edit: settings.auto_edit,
             smart_trailing_punctuation: settings.smart_trailing_punctuation,
