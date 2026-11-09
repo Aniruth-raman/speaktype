@@ -110,6 +110,11 @@ pub enum Event {
         session: u64,
         warming: bool,
     },
+    /// A streaming chunk is loading the model or finished loading it.
+    StreamWarming {
+        started_at_ms: u64,
+        warming: bool,
+    },
     Transcribed {
         session: u64,
         outcome: Outcome,
@@ -218,6 +223,7 @@ enum Phase {
         recording: Recording,
         by_hotkey: bool,
         stream: Option<Streamer>,
+        started_at_ms: u64,
     },
     Transcribing {
         session: u64,
@@ -333,6 +339,8 @@ impl Streamer {
     fn start(
         recording: &Recording,
         app: &AppHandle,
+        controller: Controller,
+        started_at_ms: u64,
         paster: Paster,
         restore_clipboard: bool,
         paste_chunks: bool,
@@ -364,7 +372,13 @@ impl Streamer {
                     pending.extend(resample(&raw, rate, WHISPER_SAMPLE_RATE));
                     while let Some(n) = cut_point(&pending) {
                         let chunk: Vec<f32> = pending.drain(..n).collect();
-                        match pipeline::transcribe(&app, &chunk, |_| {}) {
+                        let on_warming = |warming| {
+                            controller.send(Event::StreamWarming {
+                                started_at_ms,
+                                warming,
+                            });
+                        };
+                        match pipeline::transcribe(&app, &chunk, on_warming) {
                             Ok(chunk_text) => {
                                 thread_processed.fetch_add(n, Ordering::Relaxed);
                                 let chunk_text = pipeline::clean(&app, &chunk_text, false);
@@ -378,7 +392,6 @@ impl Streamer {
                             }
                             Err(e) => {
                                 eprintln!("[dictation] chunk transcription failed: {e}");
-                                return;
                             }
                         }
                     }
@@ -394,9 +407,12 @@ impl Streamer {
     }
 
     /// Stops the worker and returns its transcript and how many 16 kHz samples
-    /// it covered.
+    /// it covered. Joins so `processed` is final.
     fn finish(mut self) -> (String, usize) {
         self.stop();
+        if let Some(done) = self.done.take() {
+            let _ = done.join();
+        }
         (
             mem::take(&mut *self.text.lock_unpoisoned()),
             self.processed.load(Ordering::Relaxed),
@@ -405,14 +421,13 @@ impl Streamer {
 
     fn stop(&mut self) {
         let _ = self.stop.send(());
-        if let Some(done) = self.done.take() {
-            let _ = done.join();
-        }
     }
 }
 
 impl Drop for Streamer {
     fn drop(&mut self) {
+        // Signal only: joining here would block the controller mid-chunk on
+        // the discard path. The stream thread sees the signal and exits alone.
         self.stop();
     }
 }
@@ -441,6 +456,10 @@ impl Session {
             Event::Toggle => self.input(Input::Toggle),
             Event::Escape => self.input(Input::Escape),
             Event::Warming { session, warming } => self.warming(session, warming),
+            Event::StreamWarming {
+                started_at_ms,
+                warming,
+            } => self.stream_warming(started_at_ms, warming),
             Event::Transcribed { session, outcome } => self.transcribed(session, outcome),
             Event::MessageExpired { generation } => {
                 if matches!(self.phase, Phase::Message { generation: g } if g == generation) {
@@ -486,6 +505,8 @@ impl Session {
                 let stream = Streamer::start(
                     &recording,
                     &self.app,
+                    self.controller.clone(),
+                    started_at_ms,
                     self.paster.clone(),
                     settings.restore_clipboard,
                     settings.recording_mode == RecordingMode::Toggle,
@@ -494,6 +515,7 @@ impl Session {
                     recording,
                     by_hotkey,
                     stream,
+                    started_at_ms,
                 };
                 self.set_cancel_key(true);
                 self.show(PillState::Recording { started_at_ms });
@@ -515,8 +537,6 @@ impl Session {
         else {
             return;
         };
-        // Stop the chunk worker before the microphone so the tail starts cleanly.
-        let streamed = stream.map(Streamer::finish).unwrap_or((String::new(), 0));
         let captured = match recording.finish() {
             Ok(captured) => captured,
             Err(e) => {
@@ -543,6 +563,7 @@ impl Session {
         let worker = thread::Builder::new()
             .name("transcription".into())
             .spawn(move || {
+                let streamed = stream.map(Streamer::finish).unwrap_or((String::new(), 0));
                 let outcome = transcribe(
                     &app,
                     &controller,
@@ -578,6 +599,19 @@ impl Session {
                 message: TRANSCRIBING.into(),
             }
         });
+    }
+
+    fn stream_warming(&mut self, for_started_at_ms: u64, warming: bool) {
+        // A cancelled recording's streamer may still emit; ignore stale events.
+        if let Phase::Recording { started_at_ms, .. } = self.phase
+            && started_at_ms == for_started_at_ms
+        {
+            self.show(if warming {
+                PillState::Warming
+            } else {
+                PillState::Recording { started_at_ms }
+            });
+        }
     }
 
     fn transcribed(&mut self, session: u64, outcome: Outcome) {
