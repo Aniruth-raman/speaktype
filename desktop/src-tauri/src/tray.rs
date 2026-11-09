@@ -46,17 +46,22 @@ const ICON_IDLE_LIGHT: &[u8] = include_bytes!("../icons/tray/idle-light.png");
 const ICON_RECORDING_LIGHT: &[u8] = include_bytes!("../icons/tray/recording-light.png");
 const ICON_BUSY_LIGHT: &[u8] = include_bytes!("../icons/tray/busy-light.png");
 
-/// The dictation state the tray is showing: 0 idle, 1 recording, 2 busy.
-static STATE: AtomicU8 = AtomicU8::new(0);
+/// Tray dictation states stored in [`STATE`].
+const STATE_IDLE: u8 = 0;
+const STATE_RECORDING: u8 = 1;
+const STATE_BUSY: u8 = 2;
+
+/// The dictation state the tray is showing.
+static STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 /// Whether the white icon variants are needed (dark taskbar).
 static USE_LIGHT: AtomicBool = AtomicBool::new(false);
 
 fn icon_variant(state: u8, light: bool) -> &'static [u8] {
     match (state, light) {
-        (1, false) => ICON_RECORDING,
-        (1, true) => ICON_RECORDING_LIGHT,
-        (2, false) => ICON_BUSY,
-        (2, true) => ICON_BUSY_LIGHT,
+        (STATE_RECORDING, false) => ICON_RECORDING,
+        (STATE_RECORDING, true) => ICON_RECORDING_LIGHT,
+        (STATE_BUSY, false) => ICON_BUSY,
+        (STATE_BUSY, true) => ICON_BUSY_LIGHT,
         (_, false) => ICON_IDLE,
         (_, true) => ICON_IDLE_LIGHT,
     }
@@ -133,9 +138,9 @@ pub fn build(app: &AppHandle, visible: bool) -> tauri::Result<()> {
 pub fn show_state(app: &AppHandle, state: &DictationState) {
     STATE.store(
         match state {
-            DictationState::Idle => 0,
-            DictationState::Recording { .. } => 1,
-            DictationState::Transcribing => 2,
+            DictationState::Idle => STATE_IDLE,
+            DictationState::Recording { .. } => STATE_RECORDING,
+            DictationState::Transcribing => STATE_BUSY,
         },
         Ordering::Relaxed,
     );
